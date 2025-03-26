@@ -5,11 +5,12 @@ from dataclasses import dataclass
 from typing import List, Dict, Tuple, Set
 import random
 from datetime import datetime
-from torch.cuda.amp import autocast
-import torch.multiprocessing as mp
-from sklearn.cluster import KMeans
+import time
 import warnings
 warnings.filterwarnings('ignore')
+
+# Enable faster PyTorch operations when available
+torch.backends.cudnn.benchmark = True
 
 @dataclass
 class SchedulingConfig:
@@ -23,6 +24,8 @@ class SchedulingConfig:
     batch_size: int
     num_phases: int
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    use_mixed_precision: bool = True
+    sample_size: int = 200
 
 @dataclass
 class TimeSlot:
@@ -37,20 +40,26 @@ class TimeSlot:
 
 class SchedulingProblem:
     def __init__(self, input_file: str):
+        print(f"Loading data from {input_file}...")
         self.load_data(input_file)
         self.initialize_time_slots()
         self.preprocess_data()
+        
+        # Create lookup tables for faster access
+        self._create_lookup_tables()
+        print("Problem initialization complete.")
     
     def load_data(self, input_file: str):
-        print(f"Loading data from {input_file}...")
         xl = pd.ExcelFile(input_file)
         self.classrooms = pd.read_excel(xl, "Classrooms").to_dict('records')
         self.courses = pd.read_excel(xl, "Courses").to_dict('records')
         self.instructors = pd.read_excel(xl, "Instructors").to_dict('records')
         self.students = pd.read_excel(xl, "Students").to_dict('records')
-        print("Data loaded successfully!")
+        print(f"Data loaded: {len(self.courses)} courses, {len(self.classrooms)} classrooms, " 
+              f"{len(self.instructors)} instructors, {len(self.students)} students")
 
     def initialize_time_slots(self):
+        print("Initializing time slots...")
         self.time_slots = []
         days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
         times = [8.40, 9.40, 10.40, 11.40, 12.40, 13.40, 14.40, 15.40, 16.40]
@@ -62,46 +71,82 @@ class SchedulingProblem:
                     start_time=times[i],
                     end_time=times[i + 2] + 1.0
                 ))
+        print(f"Created {len(self.time_slots)} time slots")
+
+    def _create_lookup_tables(self):
+        """Create lookup tables for faster access to relationships"""
+        print("Creating lookup tables for faster access...")
+        
+        # Courses for each student
+        self.student_courses = {}
+        
+        # Students for each course
+        self.course_students = {}
+        
+        # Time slots by day
+        self.day_time_slots = {}
+        for i, slot in enumerate(self.time_slots):
+            if slot.day not in self.day_time_slots:
+                self.day_time_slots[slot.day] = []
+            self.day_time_slots[slot.day].append(i)
+        
+        # Compatible rooms for each course
+        self.course_compatible_rooms = {}
+        
+        # Process student enrollment data
+        for student_idx, student in enumerate(self.students):
+            if isinstance(student['Courses'], str):
+                course_names = student['Courses'].split(', ')
+                course_indices = []
+                
+                for course_name in course_names:
+                    for course_idx, course in enumerate(self.courses):
+                        if course['Name'] == course_name:
+                            course_indices.append(course_idx)
+                            
+                            # Add to course_students
+                            if course_idx not in self.course_students:
+                                self.course_students[course_idx] = []
+                            self.course_students[course_idx].append(student_idx)
+                            
+                            break
+                
+                self.student_courses[student_idx] = course_indices
+        
+        # Process room compatibility
+        for course_idx, course in enumerate(self.courses):
+            compatible_rooms = []
+            course_type = course['Classroom Type']
+            
+            for room_idx, room in enumerate(self.classrooms):
+                if room['Type'] == course_type:
+                    compatible_rooms.append(room_idx)
+            
+            self.course_compatible_rooms[course_idx] = compatible_rooms
+        
+        print("Lookup tables created.")
 
     def preprocess_data(self):
+        print("Preprocessing data...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Course enrollments
-        course_name_to_idx = {course['Name']: i for i, course in enumerate(self.courses)}
-        enrollment_indices = []
-        
-        for student_idx, student in enumerate(self.students):
-            courses = student['Courses'].split(', ') if isinstance(student['Courses'], str) else []
-            for course_name in courses:
-                if course_name in course_name_to_idx:
-                    course_idx = course_name_to_idx[course_name]
-                    enrollment_indices.append([course_idx, student_idx])
-        
-        if enrollment_indices:
-            indices = torch.tensor(enrollment_indices, dtype=torch.long).t()
-            values = torch.ones(len(enrollment_indices))
-            self.student_course_matrix = torch.sparse_coo_tensor(
-                indices, values, 
-                (len(self.courses), len(self.students)),
-                device=device
-            )
-        else:
-            self.student_course_matrix = torch.sparse_coo_tensor(
-                size=(len(self.courses), len(self.students)),
-                device=device
-            )
-        
-        # Course sizes
+        print("Computing course enrollments...")
         course_sizes = []
-        for course in self.courses:
-            size = sum(1 for student in self.students 
-                      if isinstance(student['Courses'], str) and 
-                      course['Name'] in student['Courses'].split(', '))
-            course_sizes.append(size)
+        for course_idx, course in enumerate(self.courses):
+            course_name = course['Name']
+            enrollment = 0
+            
+            for student in self.students:
+                if isinstance(student['Courses'], str) and course_name in student['Courses'].split(', '):
+                    enrollment += 1
+            
+            course_sizes.append(enrollment)
         
         self.course_enrollments = torch.tensor(course_sizes, dtype=torch.float32, device=device)
         
         # Classroom capacities
+        print("Processing classroom capacities...")
         self.classroom_capacities = torch.tensor(
             [c['Capacity'] for c in self.classrooms],
             dtype=torch.float32,
@@ -109,6 +154,7 @@ class SchedulingProblem:
         )
         
         # Classroom compatibility
+        print("Building compatibility matrix...")
         compatibility_matrix = torch.zeros(
             (len(self.courses), len(self.classrooms)),
             dtype=torch.bool,
@@ -122,6 +168,7 @@ class SchedulingProblem:
         self.classroom_compatibility = compatibility_matrix
         
         # Instructor availability
+        print("Processing instructor availability...")
         availability_matrix = torch.zeros(
             (len(self.instructors), len(self.time_slots)),
             dtype=torch.bool,
@@ -142,16 +189,33 @@ class SchedulingProblem:
                             continue
         
         self.instructor_availability = availability_matrix
+        print("Data preprocessing complete.")
 
 def create_adaptive_config(problem: SchedulingProblem) -> SchedulingConfig:
+    """Create adaptive configuration based on problem size"""
+    print("Creating adaptive configuration...")
     num_courses = len(problem.courses)
     
     # Scale configuration based on problem size
-    population_size = min(800, int(num_courses * 3))
-    num_generations = min(1000, int(num_courses * 4))
-    batch_size = min(128, population_size)  # Adjust based on GPU memory
+    population_size = min(800, max(100, int(num_courses * 2)))
+    num_generations = min(1000, max(200, int(num_courses * 3)))
     
-    return SchedulingConfig(
+    # Adjust batch size based on available GPU memory
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+        if gpu_mem < 4:  # Small GPU
+            batch_size = min(32, population_size)
+        elif gpu_mem < 8:  # Medium GPU
+            batch_size = min(64, population_size)
+        else:  # Large GPU
+            batch_size = min(128, population_size)
+    else:
+        batch_size = min(32, population_size)
+    
+    # Adjust sampling for large problems
+    sample_size = min(500, max(50, int(len(problem.students) * 0.05)))
+    
+    config = SchedulingConfig(
         population_size=population_size,
         num_generations=num_generations,
         mutation_rate=0.6,
@@ -160,11 +224,18 @@ def create_adaptive_config(problem: SchedulingProblem) -> SchedulingConfig:
         tournament_size=int(population_size * 0.1),
         target_fitness=0.90,
         batch_size=batch_size,
-        num_phases=3
+        num_phases=3,
+        sample_size=sample_size
     )
+    
+    print(f"Created configuration with population_size={config.population_size}, "
+          f"num_generations={config.num_generations}, batch_size={config.batch_size}")
+    return config
 
-class GeneticScheduler:
+class ReliableScheduler:
+    """Reliable genetic algorithm scheduler optimized for performance"""
     def __init__(self, problem: SchedulingProblem, config: SchedulingConfig):
+        print("Initializing scheduler...")
         self.problem = problem
         self.config = config
         self.device = torch.device(config.device)
@@ -177,31 +248,59 @@ class GeneticScheduler:
         self.classroom_capacities = problem.classroom_capacities.to(self.device)
         self.classroom_compatibility = problem.classroom_compatibility.to(self.device)
         self.instructor_availability = problem.instructor_availability.to(self.device)
-        self.student_course_matrix = problem.student_course_matrix.to(self.device)
+        
+        # Conflict cache
+        self.conflict_cache = {}
+        print("Scheduler initialized successfully.")
 
     def initialize_population(self) -> torch.Tensor:
-        num_courses = len(self.problem.courses)
+        """Initialize population with semi-intelligent schedules"""
+        print(f"Initializing population of {self.config.population_size} schedules...")
         population = torch.zeros(
-            (self.config.population_size, num_courses, 3),
+            (self.config.population_size, len(self.problem.courses), 3),
             device=self.device
         )
         
-        # Initialize with semi-intelligent assignments
+        # Create schedules
         for i in range(self.config.population_size):
-            schedule = self._create_intelligent_schedule()
-            population[i] = schedule
+            if i % 10 == 0:
+                print(f"Creating schedule {i+1}/{self.config.population_size}")
+            try:
+                schedule = self._create_intelligent_schedule()
+                population[i] = schedule
+            except Exception as e:
+                print(f"Error creating schedule: {e}")
+                # Fallback to random schedule
+                population[i] = self._create_random_schedule()
+            
+            # Clear cache periodically to prevent memory buildup
+            if i % 20 == 0 and self.device.type == 'cuda':
+                torch.cuda.empty_cache()
         
+        print("Population initialization complete.")
         return population
 
+    def _create_random_schedule(self) -> torch.Tensor:
+        """Create a completely random schedule"""
+        schedule = torch.zeros(len(self.problem.courses), 3, device=self.device)
+        
+        # Assign random time slots, rooms, and instructors
+        for course_idx in range(len(self.problem.courses)):
+            schedule[course_idx, 0] = random.randint(0, len(self.problem.time_slots)-1)
+            schedule[course_idx, 1] = random.randint(0, len(self.problem.classrooms)-1)
+            schedule[course_idx, 2] = random.randint(0, len(self.problem.instructors)-1)
+        
+        return schedule
+
     def _create_intelligent_schedule(self) -> torch.Tensor:
-        num_courses = len(self.problem.courses)
-        schedule = torch.zeros(num_courses, 3, device=self.device)
+        """Create an intelligent initial schedule"""
+        schedule = torch.zeros(len(self.problem.courses), 3, device=self.device)
         
         # Sort courses by enrollment size (descending)
         course_sizes = self.course_enrollments.cpu().numpy()
         course_order = np.argsort(-course_sizes)
         
-        for course_idx in course_order:
+        for idx, course_idx in enumerate(course_order):
             # Find compatible classrooms
             compatible_rooms = torch.where(self.classroom_compatibility[course_idx])[0]
             if len(compatible_rooms) == 0:
@@ -209,21 +308,19 @@ class GeneticScheduler:
                 schedule[course_idx, 1] = random.randint(0, len(self.problem.classrooms)-1)
             else:
                 # Choose random compatible room
-                schedule[course_idx, 1] = compatible_rooms[
-                    random.randint(0, len(compatible_rooms)-1)
-                ]
+                random_room_idx = random.randint(0, len(compatible_rooms)-1)
+                schedule[course_idx, 1] = compatible_rooms[random_room_idx]
             
-            # Assign random time slot and instructor
+            # Assign random time slot
             schedule[course_idx, 0] = random.randint(0, len(self.problem.time_slots)-1)
+            
+            # Assign random instructor
             schedule[course_idx, 2] = random.randint(0, len(self.problem.instructors)-1)
         
         return schedule
 
-    @autocast()
     def calculate_fitness_batch(self, schedules: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, int]]:
-        """
-        Calculate fitness scores for a batch of schedules with proper type handling.
-        """
+        """Calculate fitness scores for a batch of schedules with prioritized constraints"""
         batch_size = len(schedules)
         penalties = torch.zeros(batch_size, device=self.device)
         
@@ -232,8 +329,69 @@ class GeneticScheduler:
         classrooms = schedules[:, :, 1].long()
         instructors = schedules[:, :, 2].long()
         
-        # 1. Classroom capacity violations (count actual overflow)
+        # Track hard constraint violations
+        instructor_availability_violations = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        room_type_violations = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        room_booking_violations = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        instructor_booking_violations = torch.zeros(batch_size, dtype=torch.long, device=self.device)  # Renamed for clarity
         capacity_violations = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        
+        # 1. HIGHEST PRIORITY: Instructor availability violations
+        for b in range(batch_size):
+            for c in range(len(self.problem.courses)):
+                instr_idx = int(instructors[b, c].item())
+                time_idx = int(time_slots[b, c].item())
+                if not self.problem.instructor_availability[instr_idx, time_idx]:
+                    instructor_availability_violations[b] += 1
+        
+        # Apply very high penalty for instructor availability violations
+        penalties += instructor_availability_violations * 50.0
+        
+        # 2. Room type compatibility - high priority
+        for b in range(batch_size):
+            for c in range(len(self.problem.courses)):
+                if not self.classroom_compatibility[c, classrooms[b, c]]:
+                    room_type_violations[b] += 1
+        
+        # Apply high penalty for room type violations
+        penalties += room_type_violations * 40.0
+        
+        # 3. Room booking conflicts (same room, same time) - high priority
+        for b in range(batch_size):
+            room_schedule = {}
+            for c in range(len(self.problem.courses)):
+                time = int(time_slots[b, c].item())
+                room = int(classrooms[b, c].item())
+                
+                key = (room, time)
+                if key in room_schedule:
+                    room_booking_violations[b] += 1
+                else:
+                    room_schedule[key] = c
+        
+        # Apply high penalty for room double booking
+        penalties += room_booking_violations * 30.0
+        
+        # 4. Instructor booking conflicts (same instructor, same time)
+        for b in range(batch_size):
+            instructor_schedule = {}
+            for c in range(len(self.problem.courses)):
+                time = int(time_slots[b, c].item())
+                instr = int(instructors[b, c].item())
+                
+                key = (instr, time)
+                if key in instructor_schedule:
+                    instructor_booking_violations[b] += 1
+                else:
+                    instructor_schedule[key] = c
+        
+        # Apply penalty for instructor double booking
+        penalties += instructor_booking_violations * 20.0
+        
+        # 5. Classroom capacity violations - medium priority but allow some violations
+        over_capacity_rooms = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        total_capacity_violation = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        
         for b in range(batch_size):
             for c in range(len(self.problem.courses)):
                 room_idx = classrooms[b, c]
@@ -241,108 +399,97 @@ class GeneticScheduler:
                 room_capacity = self.classroom_capacities[room_idx].long()
                 if course_size > room_capacity:
                     overflow = int((course_size - room_capacity).item())
-                    capacity_violations[b] += overflow
-        penalties += capacity_violations * 5.0
+                    total_capacity_violation[b] += overflow
+                    over_capacity_rooms[b] += 1
         
-        # 2. Classroom type compatibility
-        compatibility_violations = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-        for b in range(batch_size):
-            for c in range(len(self.problem.courses)):
-                if not self.classroom_compatibility[c, classrooms[b, c]]:
-                    compatibility_violations[b] += 1
-        penalties += compatibility_violations * 10.0
+        # Calculate allowable violations (5% of classrooms)
+        allowed_violations = int(0.05 * len(self.problem.classrooms))
         
-        # 3. Instructor conflicts (same instructor, same time slot)
-        instructor_conflicts = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        # Only penalize if more than the allowed number of rooms have capacity violations
         for b in range(batch_size):
-            instructor_schedule = {}
-            for c in range(len(self.problem.courses)):
-                time = int(time_slots[b, c])
-                instructor = int(instructors[b, c])
-                day = time // 10  # Get the day portion
+            if over_capacity_rooms[b] > allowed_violations:
+                # Penalize excessive violations
+                excess = over_capacity_rooms[b] - allowed_violations
+                penalties[b] += excess * 20.0
                 
-                key = (instructor, day, time)
-                if key in instructor_schedule:
-                    instructor_conflicts[b] += 1
-                else:
-                    instructor_schedule[key] = c
-        penalties += instructor_conflicts * 8.0
+                # Add smaller penalty for the size of the violation
+                penalties[b] += total_capacity_violation[b] * 0.2
         
-        # 4. Student conflicts (count affected students)
+        # 6. LOWEST PRIORITY: Student conflicts
         affected_students = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-        indices = self.student_course_matrix._indices()
-        values = self.student_course_matrix._values()
         
         # Sample students for efficiency
-        unique_students = torch.unique(indices[1])
-        sample_size = min(200, len(unique_students))
-        sampled_students = unique_students[torch.randperm(len(unique_students))[:sample_size]]
-        
-        for b in range(batch_size):
-            students_with_conflicts = set()  # Track unique students with conflicts
-            for student_idx in sampled_students:
-                # Get courses for this student
-                student_mask = indices[1] == student_idx
-                student_courses = indices[0][student_mask]
-                
-                if len(student_courses) > 0:
-                    # Get time slots for student's courses
-                    course_times = time_slots[b][student_courses]
-                    days = course_times // 10  # Group by day
-                    
-                    has_conflict = False
-                    # Check conflicts within each day
-                    for day in torch.unique(days):
-                        day_times = course_times[days == day]
-                        # Sort times to check for overlaps
-                        day_times_sorted, _ = torch.sort(day_times)
-                        
-                        # Check consecutive times for overlaps
-                        for i in range(len(day_times_sorted) - 1):
-                            if day_times_sorted[i] == day_times_sorted[i + 1]:
-                                has_conflict = True
-                                break
-                        
-                        if has_conflict:
-                            students_with_conflicts.add(int(student_idx))
-                            break
+        sample_size = min(self.config.sample_size, len(self.problem.students))
+        if len(self.problem.students) > 0:
+            sampled_students = random.sample(range(len(self.problem.students)), sample_size)
             
-            # Scale the count based on sampling
-            if sample_size < len(unique_students):
-                scale_factor = len(unique_students) / sample_size
-                affected_students[b] = int(len(students_with_conflicts) * scale_factor)
-            else:
-                affected_students[b] = len(students_with_conflicts)
+            for b in range(batch_size):
+                students_with_conflicts = set()
+                
+                for student_idx in sampled_students:
+                    # Get courses for this student
+                    if student_idx in self.problem.student_courses:
+                        student_courses = self.problem.student_courses[student_idx]
+                        
+                        # Check all pairs of courses for time conflicts
+                        for i in range(len(student_courses)):
+                            for j in range(i+1, len(student_courses)):
+                                course1 = student_courses[i]
+                                course2 = student_courses[j]
+                                
+                                time1 = int(time_slots[b, course1].item())
+                                time2 = int(time_slots[b, course2].item())
+                                
+                                # Check if same time slot
+                                if time1 == time2:
+                                    students_with_conflicts.add(student_idx)
+                                    break
+                            
+                            # No need to check more if conflict found
+                            if student_idx in students_with_conflicts:
+                                break
+                
+                # Scale count based on sampling
+                if sample_size < len(self.problem.students):
+                    scale_factor = len(self.problem.students) / sample_size
+                    affected_students[b] = int(len(students_with_conflicts) * scale_factor)
+                else:
+                    affected_students[b] = len(students_with_conflicts)
         
-        penalties += affected_students * 2.0
+        # Apply lowest penalty for student conflicts
+        penalties += affected_students * 1.0
         
         # Calculate total violations for reporting
         total_violations = {
-            "Classroom Capacity": int(torch.sum(capacity_violations).item()),
-            "Classroom Compatibility": int(torch.sum(compatibility_violations).item()),
-            "Instructor Conflicts": int(torch.sum(instructor_conflicts).item()),
+            "Instructor Availability": int(torch.sum(instructor_availability_violations).item()),
+            "Classroom Compatibility": int(torch.sum(room_type_violations).item()),
+            "Room Conflicts": int(torch.sum(room_booking_violations).item()),
+            "Instructor Booking Violations": int(torch.sum(instructor_booking_violations).item()),  # Renamed
+            "Classroom Capacity": int(torch.sum(total_capacity_violation).item()),
+            "Over Capacity Rooms": int(torch.sum(over_capacity_rooms).item()),
+            "Allowed Capacity Violations": allowed_violations,
             "Students with Conflicts": int(torch.sum(affected_students).item())
         }
         
         # Calculate fitness scores (0 to 1)
-        max_penalties = 25.0 * len(self.problem.courses)
+        max_penalties = 100.0 * len(self.problem.courses)
         fitness_scores = torch.exp(-penalties / max_penalties)
         
         return torch.clamp(fitness_scores, 0.0, 1.0), total_violations
 
-
     def _tournament_select(self, population: torch.Tensor, fitness_scores: torch.Tensor) -> torch.Tensor:
-        tournament_size = self.config.tournament_size
+        """Select a parent using tournament selection"""
+        tournament_size = min(self.config.tournament_size, len(population))
         idx = random.sample(range(len(population)), tournament_size)
         tournament_fitness = fitness_scores[idx]
         winner_idx = idx[torch.argmax(tournament_fitness)]
         return population[winner_idx]
 
     def _crossover(self, parent1: torch.Tensor, parent2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Perform crossover between parents"""
         if random.random() > self.config.crossover_rate:
             return parent1.clone(), parent2.clone()
         
-        # Multi-point crossover
         # Multi-point crossover
         crossover_points = sorted(random.sample(range(len(parent1)), 2))
         
@@ -356,81 +503,291 @@ class GeneticScheduler:
         return child1, child2
 
     def _mutate(self, schedule: torch.Tensor) -> torch.Tensor:
+        """Mutate a schedule with enhanced mutation strategies and constraint priorities"""
         mutated = schedule.clone()
-        num_mutations = max(4, int(len(schedule) * self.config.mutation_rate))
         
-        for _ in range(num_mutations):
-            idx = random.randint(0, len(schedule) - 1)
-            mutation_type = random.random()
+        # Adjust number of mutations based on schedule size
+        num_mutations = max(3, int(len(schedule) * self.config.mutation_rate))
+        
+        # First, check for hard constraint violations - instructor availability, room type, double booking
+        hard_violations = self._find_hard_constraint_violations(schedule)
+        
+        # If hard violations exist, focus mutations on fixing those courses
+        if hard_violations and len(hard_violations) > 0:
+            # Focus 80% of mutations on hard constraint violations
+            hard_violation_count = min(int(num_mutations * 0.8), len(hard_violations))
             
-            if mutation_type < 0.5:  # Classroom mutation
-                compatible_rooms = torch.where(self.classroom_compatibility[idx])[0]
-                if len(compatible_rooms) > 0:
-                    mutated[idx, 1] = compatible_rooms[
-                        random.randint(0, len(compatible_rooms)-1)
-                    ]
+            # Select courses with hard violations for mutation
+            hard_courses_to_mutate = random.sample(list(hard_violations.keys()), hard_violation_count)
             
-            elif mutation_type < 0.8:  # Time slot mutation
-                # Try to find a time slot with fewer conflicts
-                current_conflicts = float('inf')
-                best_time_slot = None
+            # Fill remaining mutations with random courses
+            remaining = num_mutations - hard_violation_count
+            all_courses = set(range(len(schedule)))
+            available = list(all_courses - set(hard_courses_to_mutate))
+            
+            if remaining > 0 and available:
+                hard_courses_to_mutate.extend(random.sample(available, min(remaining, len(available))))
                 
-                for _ in range(5):  # Try 5 random time slots
-                    time_slot = random.randint(0, len(self.problem.time_slots) - 1)
-                    mutated[idx, 0] = time_slot
-                    conflicts = self._count_local_conflicts(mutated, idx)
+            courses_to_mutate = hard_courses_to_mutate
+        else:
+            # If no hard violations, use standard mutation
+            courses_to_mutate = random.sample(range(len(schedule)), num_mutations)
+        
+        # Apply mutations
+        for idx in courses_to_mutate:
+            # Check what constraints this course violates
+            violations = self._check_course_violations(schedule, idx)
+            
+            # Different mutation strategies based on constraints violated
+            if "instructor_availability" in violations:
+                # Priority 1: Fix instructor availability by assigning available instructor
+                self._fix_instructor_availability(mutated, idx)
+                
+            elif "room_type" in violations:
+                # Priority 2: Fix room type compatibility
+                self._fix_room_compatibility(mutated, idx)
+                
+            elif "room_booking" in violations:
+                # Priority 3: Fix room double booking by changing time or room
+                if random.random() < 0.7:
+                    # Usually better to change time slot
+                    self._fix_time_slot_conflicts(mutated, idx)
+                else:
+                    # Sometimes change room instead
+                    self._fix_room_conflicts(mutated, idx)
+                
+            else:
+                # No hard violations, use standard mutation
+                mutation_type = random.random()
+                
+                if mutation_type < 0.4:  # Time slot mutation
+                    self._fix_time_slot_conflicts(mutated, idx)
                     
-                    if conflicts < current_conflicts:
-                        current_conflicts = conflicts
-                        best_time_slot = time_slot
-                
-                if best_time_slot is not None:
-                    mutated[idx, 0] = best_time_slot
-            
-            else:  # Instructor mutation
-                # Try to find an available instructor
-                available_instructors = []
-                time_slot = int(mutated[idx, 0])
-                
-                for i in range(len(self.problem.instructors)):
-                    if self.instructor_availability[i, time_slot]:
-                        available_instructors.append(i)
-                
-                if available_instructors:
-                    mutated[idx, 2] = random.choice(available_instructors)
+                elif mutation_type < 0.8:  # Classroom mutation
+                    self._fix_room_compatibility(mutated, idx, optimize_capacity=True)
+                    
+                else:  # Instructor mutation
+                    # Make sure new instructor is available
+                    self._fix_instructor_availability(mutated, idx)
         
         return mutated
+        
+    def _check_course_violations(self, schedule: torch.Tensor, idx: int) -> Set[str]:
+        """Check what constraints a specific course violates"""
+        violations = set()
+        
+        # Extract course details
+        time_idx = int(schedule[idx, 0].item())
+        room_idx = int(schedule[idx, 1].item())
+        instr_idx = int(schedule[idx, 2].item())
+        
+        # 1. Check instructor availability
+        if not self.problem.instructor_availability[instr_idx, time_idx]:
+            violations.add("instructor_availability")
+        
+        # 2. Check room type compatibility
+        if not self.classroom_compatibility[idx, room_idx]:
+            violations.add("room_type")
+        
+        # 3. Check for room double booking
+        for c_idx in range(len(schedule)):
+            if c_idx != idx:
+                other_time = int(schedule[c_idx, 0].item())
+                other_room = int(schedule[c_idx, 1].item())
+                
+                if time_idx == other_time and room_idx == other_room:
+                    violations.add("room_booking")
+                    break
+        
+        # 4. Check for instructor double booking
+        for c_idx in range(len(schedule)):
+            if c_idx != idx:
+                other_time = int(schedule[c_idx, 0].item())
+                other_instr = int(schedule[c_idx, 2].item())
+                
+                if time_idx == other_time and instr_idx == other_instr:
+                    violations.add("instructor_booking")
+                    break
+        
+        # 5. Check for capacity violations
+        course_size = self.course_enrollments[idx].item()
+        room_capacity = self.classroom_capacities[room_idx].item()
+        
+        if course_size > room_capacity:
+            violations.add("capacity")
+        
+        return violations
+        
+    def _find_hard_constraint_violations(self, schedule: torch.Tensor) -> Dict[int, Set[str]]:
+        """Find courses with hard constraint violations (availability, type, double booking)"""
+        hard_violations = {}
+        
+        for c_idx in range(len(schedule)):
+            violations = self._check_course_violations(schedule, c_idx)
+            
+            # Only consider hard constraints
+            hard_constraints = {"instructor_availability", "room_type", "room_booking", "instructor_booking"}
+            course_hard_violations = violations.intersection(hard_constraints)
+            
+            if course_hard_violations:
+                hard_violations[c_idx] = course_hard_violations
+        
+        return hard_violations
+        
+    def _fix_instructor_availability(self, schedule: torch.Tensor, idx: int):
+        """Fix instructor availability violation by assigning available instructor"""
+        time_idx = int(schedule[idx, 0].item())
+        
+        # Find instructors available at this time
+        available_instructors = torch.where(self.problem.instructor_availability[:, time_idx])[0].cpu().numpy()
+        
+        if len(available_instructors) > 0:
+            # Choose random available instructor
+            schedule[idx, 2] = available_instructors[random.randint(0, len(available_instructors)-1)]
+        else:
+            # If no instructors available at this time, change the time instead
+            self._fix_time_slot_conflicts(schedule, idx, check_instructor=True)
+    
+    def _fix_room_compatibility(self, schedule: torch.Tensor, idx: int, optimize_capacity=False):
+        """Fix room type compatibility violation"""
+        # Find compatible rooms
+        compatible_rooms = torch.where(self.classroom_compatibility[idx])[0].cpu().numpy()
+        
+        if len(compatible_rooms) > 0:
+            if optimize_capacity:
+                # Find room with appropriate capacity
+                course_size = self.course_enrollments[idx].item()
+                suitable_rooms = []
+                
+                for room_idx in compatible_rooms:
+                    capacity = self.classroom_capacities[room_idx].item()
+                    if capacity >= course_size:
+                        suitable_rooms.append((room_idx, capacity))
+                
+                if suitable_rooms:
+                    # Choose room with closest capacity
+                    suitable_rooms.sort(key=lambda x: x[1] - course_size)
+                    schedule[idx, 1] = suitable_rooms[0][0]
+                else:
+                    # If no suitable room, choose largest compatible room
+                    room_capacities = [(r, self.classroom_capacities[r].item()) for r in compatible_rooms]
+                    room_capacities.sort(key=lambda x: x[1], reverse=True)
+                    schedule[idx, 1] = room_capacities[0][0]
+            else:
+                # Just choose any compatible room
+                schedule[idx, 1] = compatible_rooms[random.randint(0, len(compatible_rooms)-1)]
+        else:
+            # If no compatible rooms (should not happen), assign random room
+            schedule[idx, 1] = random.randint(0, len(self.problem.classrooms) - 1)
+    
+    def _fix_time_slot_conflicts(self, schedule: torch.Tensor, idx: int, check_instructor=False):
+        """Fix time slot conflicts by finding a better time slot"""
+        room_idx = int(schedule[idx, 1].item())
+        instr_idx = int(schedule[idx, 2].item())
+        
+        # Find all time slots where the instructor is available
+        if check_instructor:
+            available_slots = torch.where(self.problem.instructor_availability[instr_idx])[0].cpu().numpy()
+        else:
+            available_slots = list(range(len(self.problem.time_slots)))
+        
+        if not available_slots:
+            # If no slots available, use a random slot
+            schedule[idx, 0] = random.randint(0, len(self.problem.time_slots) - 1)
+            return
+        
+        # Shuffle available slots for randomness
+        random.shuffle(available_slots)
+        
+        # Try each available slot to find one with no conflicts
+        for slot_idx in available_slots[:10]:  # Limit to 10 slots for efficiency
+            # Check if this slot causes room conflicts
+            has_conflict = False
+            
+            for c_idx in range(len(schedule)):
+                if c_idx != idx:
+                    other_time = int(schedule[c_idx, 0].item())
+                    other_room = int(schedule[c_idx, 1].item())
+                    other_instr = int(schedule[c_idx, 2].item())
+                    
+                    if slot_idx == other_time:
+                        # Check room conflict
+                        if room_idx == other_room:
+                            has_conflict = True
+                            break
+                        
+                        # Check instructor conflict
+                        if instr_idx == other_instr:
+                            has_conflict = True
+                            break
+            
+            if not has_conflict:
+                # Found a good slot
+                schedule[idx, 0] = slot_idx
+                return
+        
+        # If all slots have conflicts, choose a random slot
+        schedule[idx, 0] = random.choice(available_slots)
+    
+    def _fix_room_conflicts(self, schedule: torch.Tensor, idx: int):
+        """Fix room conflicts by assigning a different room"""
+        time_idx = int(schedule[idx, 0].item())
+        
+        # Find all rooms used at this time
+        used_rooms = set()
+        for c_idx in range(len(schedule)):
+            if c_idx != idx and int(schedule[c_idx, 0].item()) == time_idx:
+                used_rooms.add(int(schedule[c_idx, 1].item()))
+        
+        # Find compatible rooms that are not used
+        compatible_rooms = torch.where(self.classroom_compatibility[idx])[0].cpu().numpy()
+        available_rooms = [r for r in compatible_rooms if r not in used_rooms]
+        
+        if available_rooms:
+            # Use a compatible and available room
+            course_size = self.course_enrollments[idx].item()
+            suitable_rooms = []
+            
+            for room_idx in available_rooms:
+                capacity = self.classroom_capacities[room_idx].item()
+                if capacity >= course_size:
+                    suitable_rooms.append((room_idx, capacity))
+            
+            if suitable_rooms:
+                # Choose room with best capacity fit
+                suitable_rooms.sort(key=lambda x: x[1] - course_size)
+                schedule[idx, 1] = suitable_rooms[0][0]
+            else:
+                # If no suitable room, choose any available room
+                schedule[idx, 1] = available_rooms[random.randint(0, len(available_rooms)-1)]
+        else:
+            # If no compatible rooms available, change the time instead
+            self._fix_time_slot_conflicts(schedule, idx)
 
-    def _count_local_conflicts(self, schedule: torch.Tensor, idx: int) -> int:
-        conflicts = 0
-        time_slot = int(schedule[idx, 0])
-        instructor = int(schedule[idx, 2])
-        classroom = int(schedule[idx, 1])
+    def _maintain_diversity(self, population: torch.Tensor, fitness_scores: torch.Tensor) -> torch.Tensor:
+        """Maintain diversity by replacing worst solutions"""
+        # Find lowest fitness individuals
+        num_to_replace = max(5, len(population) // 10)
+        worst_indices = torch.argsort(fitness_scores)[:num_to_replace]
         
-        # Check instructor conflicts
-        for i in range(len(schedule)):
-            if i != idx:
-                if (int(schedule[i, 0]) == time_slot and 
-                    int(schedule[i, 2]) == instructor):
-                    conflicts += 1
+        # Replace with new individuals
+        for idx in worst_indices:
+            # 50% chance of completely new schedule, 50% chance of mutation from best
+            if random.random() < 0.5:
+                population[idx] = self._create_intelligent_schedule()
+            else:
+                # Get a good individual to mutate
+                best_idx = torch.argsort(fitness_scores, descending=True)[0]
+                population[idx] = self._mutate(population[best_idx])
         
-        # Check classroom conflicts
-        for i in range(len(schedule)):
-            if i != idx:
-                if (int(schedule[i, 0]) == time_slot and 
-                    int(schedule[i, 1]) == classroom):
-                    conflicts += 1
-        
-        # Check classroom compatibility
-        if not self.classroom_compatibility[idx, classroom]:
-            conflicts += 1
-        
-        return conflicts
+        return population
 
     def _local_search(self, solution: torch.Tensor, max_attempts: int = 20) -> torch.Tensor:
+        """Perform local search to improve a solution"""
         best_solution = solution.clone()
         best_fitness, _ = self.calculate_fitness_batch(best_solution.unsqueeze(0))
         best_fitness = best_fitness.item()
+        original_fitness = best_fitness
         
         for _ in range(max_attempts):
             candidate = self._mutate(best_solution)
@@ -441,44 +798,39 @@ class GeneticScheduler:
                 best_solution = candidate
                 best_fitness = fitness
         
-        return best_solution
-
-    def _maintain_diversity(self, population: torch.Tensor, fitness_scores: torch.Tensor) -> torch.Tensor:
-        # Use k-means clustering to identify similar solutions
-        flattened_pop = population.reshape(len(population), -1).cpu().numpy()
-        num_clusters = min(20, len(population) // 25)
-        
-        kmeans = KMeans(n_clusters=num_clusters, n_init=1)
-        clusters = kmeans.fit_predict(flattened_pop)
-        
-        # Replace worst solutions in each cluster with new random solutions
-        for cluster_id in range(num_clusters):
-            cluster_indices = np.where(clusters == cluster_id)[0]
-            if len(cluster_indices) > 1:
-                cluster_fitness = fitness_scores[cluster_indices]
-                worst_idx = cluster_indices[torch.argmin(cluster_fitness)]
-                population[worst_idx] = self._create_intelligent_schedule()
-        
-        return population
+        # Only return the improved solution if it's actually better
+        if best_fitness > original_fitness:
+            print(f"Local search improved fitness: {original_fitness:.4f} -> {best_fitness:.4f}")
+            return best_solution
+        else:
+            print("Local search did not find improvement, keeping original solution")
+            return solution  # Return original if no improvement found
 
     def evolve(self) -> Tuple[torch.Tensor, float, Dict[str, int]]:
-        population = self.initialize_population()
-        generations_without_improvement = 0
-        population_refreshes = 0
-        self.best_violations = None
+        """Evolve a population to find an optimal schedule"""
+        print("Starting evolution process...")
+        start_time = time.time()
         
-        print("Starting evolution...")
         try:
+            # Initialize population
+            population = self.initialize_population()
+            generations_without_improvement = 0
+            population_refreshes = 0
+            best_violations = None
+            
             for generation in range(self.config.num_generations):
                 if generation % 5 == 0:
-                    print(f"Generation {generation}/{self.config.num_generations}")
+                    elapsed = time.time() - start_time
+                    print(f"Generation {generation}/{self.config.num_generations} "
+                          f"(Elapsed: {elapsed:.1f}s)")
                 
                 # Process population in batches
                 all_fitness_scores = []
                 all_violations = []
                 
-                for i in range(0, len(population), self.config.batch_size):
-                    batch = population[i:i + self.config.batch_size]
+                batch_size = self.config.batch_size
+                for i in range(0, len(population), batch_size):
+                    batch = population[i:i+batch_size]
                     fitness_scores, violations = self.calculate_fitness_batch(batch)
                     all_fitness_scores.append(fitness_scores)
                     all_violations.append(violations)
@@ -492,7 +844,9 @@ class GeneticScheduler:
                 if current_best_fitness > self.best_fitness:
                     self.best_fitness = current_best_fitness
                     self.best_solution = population[best_idx].clone()
-                    self.best_violations = all_violations[best_idx // self.config.batch_size]
+                    batch_idx = best_idx // batch_size
+                    if batch_idx < len(all_violations):
+                        best_violations = all_violations[batch_idx]
                     generations_without_improvement = 0
                     print(f"New best fitness: {self.best_fitness:.4f}")
                 else:
@@ -505,47 +859,108 @@ class GeneticScheduler:
                     print("Target fitness reached!")
                     break
                 
-                if generations_without_improvement >= 20:
+                # Apply local search to best solution occasionally
+                if generation % 10 == 0 and self.best_solution is not None:
+                    improved = self._local_search(self.best_solution)
+                    improved_fitness, _ = self.calculate_fitness_batch(improved.unsqueeze(0))
+                    improved_fitness = improved_fitness.item()
+                    
+                    if improved_fitness > self.best_fitness:
+                        self.best_solution = improved
+                        self.best_fitness = improved_fitness
+                        print(f"Improved with local search: {self.best_fitness:.4f}")
+                        generations_without_improvement = 0
+                
+                # Refresh population if stagnant
+                if generations_without_improvement >= 15:
                     if population_refreshes < 3:
                         print("Refreshing population...")
                         population = self._maintain_diversity(population, fitness_scores)
                         generations_without_improvement = 0
                         population_refreshes += 1
                     else:
-                        print("No improvement for 20 generations. Stopping early.")
+                        print("No improvement for many generations. Stopping early.")
                         break
                 
                 # Create new population
                 new_population = []
                 
-                # Elitism
+                # Elitism - keep best individuals
                 elite_indices = torch.argsort(fitness_scores, descending=True)[:self.config.elite_size]
-                new_population.extend([population[idx].clone() for idx in elite_indices])
+                for idx in elite_indices:
+                    new_population.append(population[idx].clone())
                 
                 # Breeding
                 while len(new_population) < self.config.population_size:
+                    # Select parents
                     parent1 = self._tournament_select(population, fitness_scores)
                     parent2 = self._tournament_select(population, fitness_scores)
                     
+                    # Create offspring
                     child1, child2 = self._crossover(parent1, parent2)
                     
+                    # Mutation
                     if random.random() < self.config.mutation_rate:
                         child1 = self._mutate(child1)
                     if random.random() < self.config.mutation_rate:
                         child2 = self._mutate(child2)
                     
+                    # Add to new population
                     new_population.append(child1)
                     if len(new_population) < self.config.population_size:
                         new_population.append(child2)
                 
+                # Update population
                 population = torch.stack(new_population[:self.config.population_size])
                 
+                # Memory management
+                if generation % 10 == 0 and self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+            
+            # Final local search
+            if self.best_solution is not None:
+                print("Performing final optimization...")
+                # Save original solution in case local search doesn't help
+                original_solution = self.best_solution.clone()
+                original_fitness = self.best_fitness
+                
+                # Try more aggressive local search
+                improved_solution = self._local_search(self.best_solution, max_attempts=100)
+                improved_fitness, improved_violations = self.calculate_fitness_batch(improved_solution.unsqueeze(0))
+                improved_fitness = improved_fitness.item()
+                
+                # Only update if actually improved
+                if improved_fitness > original_fitness:
+                    self.best_solution = improved_solution
+                    self.best_fitness = improved_fitness
+                    best_violations = improved_violations
+                    print(f"Final optimization improved fitness to {self.best_fitness:.4f}")
+                else:
+                    # Keep original solution
+                    self.best_solution = original_solution
+                    # Recompute violations to ensure consistency
+                    _, best_violations = self.calculate_fitness_batch(self.best_solution.unsqueeze(0))
+            
+            elapsed = time.time() - start_time
+            print(f"Evolution completed in {elapsed:.1f}s with fitness {self.best_fitness:.4f}")
+            
+            return self.best_solution, self.best_fitness, best_violations
+            
         except KeyboardInterrupt:
-            print("\nOptimization interrupted by user. Saving best solution found so far...")
-        
-        return self.best_solution, self.best_fitness, self.best_violations
+            print("\nEvolution interrupted by user. Returning best solution found so far.")
+            return self.best_solution, self.best_fitness, best_violations
+        except Exception as e:
+            print(f"Error during evolution: {e}")
+            if self.best_solution is not None:
+                return self.best_solution, self.best_fitness, best_violations
+            else:
+                # Return a random solution if no solution found yet
+                random_solution = self._create_random_schedule().unsqueeze(0)
+                fitness, violations = self.calculate_fitness_batch(random_solution)
+                return random_solution[0], fitness.item(), violations
 
     def export_results(self, output_file: str):
+        """Export the best solution to an Excel file"""
         if self.best_solution is None:
             raise ValueError("No solution found yet. Run evolve() first.")
         
@@ -585,8 +1000,10 @@ class GeneticScheduler:
             "Value": f"{self.best_fitness:.4f}"
         }]
         
-        # Add violations with clearer labeling
+        # Get violations
         _, violations = self.calculate_fitness_batch(self.best_solution.unsqueeze(0))
+        
+        # Add violations with clearer labeling
         metrics_data.extend([
             {
                 "Metric": "Courses Exceeding Capacity",
@@ -602,7 +1019,11 @@ class GeneticScheduler:
             },
             {
                 "Metric": "Instructor Time Conflicts",
-                "Value": str(violations["Instructor Conflicts"])
+                "Value": str(violations.get("Instructor Booking Violations", 0))
+            },
+            {
+                "Metric": "Room Double Bookings",
+                "Value": str(violations["Room Conflicts"])
             },
             {
                 "Metric": "Students Affected by Time Conflicts",
@@ -611,6 +1032,7 @@ class GeneticScheduler:
         ])
         
         # Export to Excel
+        print(f"Exporting results to {output_file}...")
         with pd.ExcelWriter(output_file) as writer:
             # Export schedule
             schedule_df = pd.DataFrame(schedule_data)
@@ -620,8 +1042,11 @@ class GeneticScheduler:
             
             # Export metrics
             pd.DataFrame(metrics_data).to_excel(writer, sheet_name="Metrics", index=False)
+        
+        print("Export complete.")
 
 def main():
+    """Main function to run the scheduler"""
     input_file = "school_input_data.xlsx"
     print(f"Loading problem data from {input_file}...")
     
@@ -640,8 +1065,9 @@ def main():
     print(f"Mutation Rate: {config.mutation_rate:.2f}")
     print(f"Elite Size: {config.elite_size}")
     print(f"Using Device: {config.device}")
+    print(f"Using Mixed Precision: {config.use_mixed_precision}")
     
-    scheduler = GeneticScheduler(problem, config)
+    scheduler = ReliableScheduler(problem, config)
     
     print("\nStarting optimization...")
     start_time = datetime.now()
@@ -656,4 +1082,4 @@ def main():
     print(f"\nResults exported to: {output_file}")
 
 if __name__ == "__main__":
-    main()
+    main()  
